@@ -240,10 +240,22 @@ def prep_neurons_from_connector_table(con, nodes, all_neurons):
     # filter nodes to just presynaptic sites 
     presyn_nodes = con['presynaptic_to_node'].unique()
     nodes_presyn = nodes[nodes['node_id'].isin(presyn_nodes)]
-    node_to_xyz = dict(zip(nodes_presyn['node_id'], nodes_presyn[['x', 'y', 'z']].values.tolist()))
+
+    # to get node features - get one hot encoded axon/dendrite/other compartment and scale cumulative distance by total length of either compartment
+    axon_length_per_neuron = nodes[nodes['compartment'] == 'axon'].groupby('skeleton_id')['cum_dist'].max().to_dict()
+    dendrite_length_per_neuron = nodes[nodes['compartment'] == 'dendrite'].groupby('skeleton_id')['cum_dist'].max().to_dict()
+
+    comp_to_comp_id = {'axon': 0, 'dendrite': 1, 'linker': 0.5}
+    node_to_comp_id = nodes_presyn.set_index('node_id')['compartment'].map(comp_to_comp_id).to_dict()
+    nodes_presyn['compartment_id'] = nodes_presyn['node_id'].map(node_to_comp_id)
+    nodes_presyn['compartment_relative_dist'] = nodes_presyn.apply(lambda row: row['cum_dist'] / axon_length_per_neuron[row['skeleton_id']] if row['compartment'] == 'axon' else row['cum_dist'] / dendrite_length_per_neuron[row['skeleton_id']], axis=1)
+
+    node_to_cumdist = nodes_presyn.set_index('node_id')['compartment_relative_dist'].to_dict()
+
+    node_to_features = dict(zip(nodes_presyn['node_id'], nodes_presyn[['compartment_id', 'compartment_relative_dist']].values.tolist()))
 
 
-    con['site_locations'] = con['presynaptic_to_node'].map(node_to_xyz)
+    con['site_locations'] = con['presynaptic_to_node'].map(node_to_features)
 
     # get a vector of target_ids per presynaptic site 
     target_ids = con.groupby('presynaptic_to')['postsynaptic_to'].apply(lambda x: list(set(chain.from_iterable(x)))).to_dict()
@@ -263,9 +275,11 @@ def prep_neurons_from_connector_table(con, nodes, all_neurons):
         neuron = prepare_neuron(pre_id, site_locations, assignment, target_ids)
         neurons.append(neuron)
         index_to_neuron[e] = pre_id
-    return neurons, index_to_neuron, node_to_xyz
+    return neurons, index_to_neuron, node_to_features
 
-neurons, index_to_neuron, node_to_xyz = prep_neurons_from_connector_table(con, nodes, all_neurons)
+neurons, index_to_neuron, node_to_features = prep_neurons_from_connector_table(con, nodes, all_neurons)
+#%% 
+
 
 
 #%% run 
