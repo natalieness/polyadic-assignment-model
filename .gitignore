@@ -6,6 +6,7 @@ pymaid_creds.py
 *__pycache__*
 *.DS_Store*
 .claude/
+*.pytest_cache/
 
 
 
@@ -27,3 +28,4 @@ figures/
 *.tif
 *.gz
 *.parquet
+*.npz

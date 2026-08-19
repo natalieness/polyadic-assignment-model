@@ -1,0 +1,5 @@
+numpy>=1.24
+pandas>=2.0
+# Optional but strongly recommended: accelerates nearest-neighbour geometry
+# and produces exact Hungarian site matching during evaluation.
+scipy>=1.11
