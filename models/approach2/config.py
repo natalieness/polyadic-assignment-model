@@ -28,13 +28,20 @@ class CotargetConfig:
     enabled: bool = True
     source: str = "observed_neuron"  # observed_neuron | supplied | none
     supplied_scores: str | None = None
-    expectation: str = "geometry"  # geometry | null
+    # Independent margin-preserving shuffles drawn as the co-targeting expectation.
+    # Set separately from sampler.prediction_samples: the expectation wants many
+    # cheap draws for a low-variance denominator, the conditions want few expensive ones.
+    n_perm_expectation: int = 100
     smoothing: float = 1.0
     shrinkage: float = 10.0
     standardize_scores: bool = True
     score_clip: float | None = 2.0
     aggregation: str = "mean"  # mean | sum
     site_score_clip: float | None = 2.0
+    # Score a target repeated within one site against its own diagonal propensity.
+    # The whole matrix stays in site units: the diagonal counts sites where a target
+    # appears more than once, exactly as the off diagonal counts sites sharing a pair.
+    include_self_repeats: bool = False
 
 
 @dataclass
@@ -81,8 +88,8 @@ class Approach2Config:
             raise ValueError("cotarget.source must be observed_neuron, supplied, or none")
         if self.cotarget.source == "supplied" and not self.cotarget.supplied_scores:
             raise ValueError("cotarget.supplied_scores is required for supplied scores")
-        if self.cotarget.expectation not in {"geometry", "null"}:
-            raise ValueError("cotarget.expectation must be geometry or null")
+        if self.cotarget.n_perm_expectation < 1:
+            raise ValueError("cotarget.n_perm_expectation must be at least one")
         if self.cotarget.smoothing <= 0 or self.cotarget.shrinkage < 0:
             raise ValueError("invalid cotarget smoothing or shrinkage")
         if self.cotarget.aggregation not in {"mean", "sum"}:
@@ -108,6 +115,11 @@ class Approach2Config:
         if self.sampler.preserve_multiplicity_profile and self.sampler.self_repeat_penalty:
             raise ValueError(
                 "self_repeat_penalty has no effect with a locked multiplicity profile"
+            )
+        if self.cotarget.include_self_repeats and self.sampler.self_repeat_penalty:
+            raise ValueError(
+                "cotarget.include_self_repeats and sampler.self_repeat_penalty both "
+                "price within-site repeats; enable only one"
             )
         if (
             self.sampler.max_same_target_per_site is not None

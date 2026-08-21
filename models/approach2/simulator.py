@@ -36,6 +36,30 @@ def _rng(config: Approach2Config, skeleton_id: int, sample: int, stream: int):
     ]))
 
 
+def permutation_expectation_samples(
+    inputs: FixedNeuronInputs,
+    config: Approach2Config,
+) -> np.ndarray:
+    """Draw independent margin-preserving shuffles for the co-targeting expectation.
+
+    Each draw shuffles labelled target tokens into the fixed site slots, so the site
+    degrees and target totals stay exact while the pairing is random. Nothing here
+    reads the simulated conditions: the expectation is not the null or geometry
+    chain reused, so it carries no MCMC autocorrelation and its draw count is set by
+    ``cotarget.n_perm_expectation`` rather than by ``sampler.prediction_samples``.
+    """
+    return np.stack([
+        sample_random_null(
+            inputs.site_degrees,
+            inputs.target_counts,
+            _rng(config, inputs.skeleton_id, index, 50),
+            max_same_target_per_site=config.sampler.max_same_target_per_site,
+            max_restarts=config.sampler.max_null_restarts,
+        )
+        for index in range(int(config.cotarget.n_perm_expectation))
+    ])
+
+
 def _cosine(left: np.ndarray, right: np.ndarray) -> float:
     left = np.asarray(left, dtype=float).ravel()
     right = np.asarray(right, dtype=float).ravel()
@@ -86,8 +110,9 @@ def _condition_summary(
     samples_by_condition: dict[str, np.ndarray],
     inputs: FixedNeuronInputs,
     geometry: GeometryResult,
+    include_self_repeats: bool = False,
 ) -> pd.DataFrame:
-    observed_pairs = pair_count_matrix(inputs.observed_assignment)
+    observed_pairs = pair_count_matrix(inputs.observed_assignment, include_self_repeats)
     total_contacts = int(inputs.site_degrees.sum())
     rows = []
     for condition, samples in samples_by_condition.items():
@@ -109,7 +134,9 @@ def _condition_summary(
             metrics.append({
                 "contact_accuracy": 1.0 - contact_l1 / max(2 * total_contacts, 1),
                 "assignment_cosine": _cosine(assignment, inputs.observed_assignment),
-                "pair_cosine": _cosine(pair_count_matrix(assignment), observed_pairs),
+                "pair_cosine": _cosine(
+                    pair_count_matrix(assignment, include_self_repeats), observed_pairs
+                ),
                 "repeated_contacts": repeated,
                 "same_target_pairs": same_pairs,
                 "distinct_target_pairs": distinct_pairs,
@@ -125,48 +152,6 @@ def _condition_summary(
     return pd.DataFrame.from_records(rows)
 
 
-def _pair_attribution(
-    samples_by_condition: dict[str, np.ndarray],
-    inputs: FixedNeuronInputs,
-    cotarget_scores: np.ndarray,
-    expected_for_propensity: np.ndarray,
-) -> pd.DataFrame:
-    matrices = {
-        condition: mean_pair_count_matrix(samples)
-        for condition, samples in samples_by_condition.items()
-    }
-    observed = pair_count_matrix(inputs.observed_assignment)
-    null = matrices["null"]
-    geometry = matrices["geometry"]
-    cotarget = matrices["cotargeting"]
-    combined = matrices["combined"]
-    geometry_main = geometry - null
-    cotarget_main = cotarget - null
-    interaction = combined - geometry - cotarget + null
-    geometry_shapley = 0.5 * ((geometry - null) + (combined - cotarget))
-    cotarget_shapley = 0.5 * ((cotarget - null) + (combined - geometry))
-    rows = []
-    for left in range(len(inputs.target_ids)):
-        for right in range(left + 1, len(inputs.target_ids)):
-            rows.append({
-                "target_a": int(inputs.target_ids[left]),
-                "target_b": int(inputs.target_ids[right]),
-                "observed_sites_together": float(observed[left, right]),
-                "propensity_expectation": float(expected_for_propensity[left, right]),
-                "cotarget_propensity_score": float(cotarget_scores[left, right]),
-                "null_mean": float(null[left, right]),
-                "geometry_mean": float(geometry[left, right]),
-                "cotargeting_mean": float(cotarget[left, right]),
-                "combined_mean": float(combined[left, right]),
-                "geometry_main_effect": float(geometry_main[left, right]),
-                "cotargeting_main_effect": float(cotarget_main[left, right]),
-                "interaction": float(interaction[left, right]),
-                "geometry_shapley_contribution": float(geometry_shapley[left, right]),
-                "cotargeting_shapley_contribution": float(cotarget_shapley[left, right]),
-            })
-    return pd.DataFrame.from_records(rows)
-
-
 @dataclass
 class AttributionResult:
     inputs: FixedNeuronInputs
@@ -176,7 +161,6 @@ class AttributionResult:
     propensity_expectation: np.ndarray
     samples: dict[str, np.ndarray]
     condition_summary: pd.DataFrame
-    pair_attribution: pd.DataFrame
     diagnostics: dict[str, Any]
 
     def validate(self) -> None:
@@ -227,8 +211,13 @@ class AttributionResult:
             output / "geometry_scores.csv", index=False
         )
         cotarget_rows = []
+        # Self scores live on the diagonal, so the row range starts one earlier when
+        # they are in play. target_a == target_b marks a self-repeat score.
+        include_self = bool(self.diagnostics.get("cotargeting_include_self_repeats"))
         for left in range(len(self.inputs.target_ids)):
-            for right in range(left + 1, len(self.inputs.target_ids)):
+            for right in range(
+                left if include_self else left + 1, len(self.inputs.target_ids)
+            ):
                 cotarget_rows.append({
                     "target_a": int(self.inputs.target_ids[left]),
                     "target_b": int(self.inputs.target_ids[right]),
@@ -248,7 +237,6 @@ class AttributionResult:
                 output / f"assignment_summary_{condition}.csv", index=False
             )
         self.condition_summary.to_csv(output / "condition_summary.csv", index=False)
-        self.pair_attribution.to_csv(output / "pair_attribution.csv", index=False)
         (output / "diagnostics.json").write_text(
             json.dumps(self.diagnostics, indent=2) + "\n"
         )
@@ -277,13 +265,41 @@ def run_attribution_experiment(
     zero_cotarget = np.zeros((len(inputs.target_ids), len(inputs.target_ids)), dtype=float)
     base_samples = []
     geometry_samples = []
-    breakpoint()
+
     if config.sampler.max_same_target_per_site is not None and (
         inputs.observed_assignment.max(initial=0)
         > config.sampler.max_same_target_per_site
         and config.sampler.multiplicity_profile_source == "observed"
     ):
         raise ValueError("Observed multiplicity exceeds max_same_target_per_site")
+
+    # The expectation comes from its own permutations, so the co-targeting scores are
+    # settled before any condition is simulated rather than after the null run.
+    expectation_samples = permutation_expectation_samples(inputs, config)
+    include_self_repeats = bool(config.cotarget.include_self_repeats)
+    observed_pairs = pair_count_matrix(inputs.observed_assignment, include_self_repeats)
+    if not config.cotarget.enabled or config.cotarget.source == "none":
+        cotarget_scores = zero_cotarget
+        expected_for_propensity = mean_pair_count_matrix(
+            expectation_samples, include_self_repeats
+        )
+    elif config.cotarget.source == "supplied":
+        cotarget_scores = load_supplied_propensity(
+            config.cotarget.supplied_scores or "",
+            inputs.target_ids,
+            config.cotarget,
+        )
+        expected_for_propensity = mean_pair_count_matrix(
+            expectation_samples, include_self_repeats
+        )
+    else:
+        cotarget_scores, observed_pairs, expected_for_propensity = (
+            estimate_individual_propensity(
+                inputs.observed_assignment,
+                expectation_samples,
+                config.cotarget,
+            )
+        )
 
     for sample_index in range(n_samples):
         if config.sampler.multiplicity_profile_source == "observed":
@@ -337,35 +353,6 @@ def run_attribution_experiment(
     null_samples = np.stack(base_samples)
     geometry_samples_array = np.stack(geometry_samples)
 
-    observed_pairs = pair_count_matrix(inputs.observed_assignment)
-    if not config.cotarget.enabled or config.cotarget.source == "none":
-        cotarget_scores = zero_cotarget
-        expected_for_propensity = mean_pair_count_matrix(null_samples)
-    elif config.cotarget.source == "supplied":
-        cotarget_scores = load_supplied_propensity(
-            config.cotarget.supplied_scores or "",
-            inputs.target_ids,
-            config.cotarget,
-        )
-        expected_for_propensity = mean_pair_count_matrix(
-            geometry_samples_array
-            if config.cotarget.expectation == "geometry"
-            else null_samples
-        )
-    else:
-        expectation_samples = (
-            geometry_samples_array
-            if config.cotarget.expectation == "geometry"
-            else null_samples
-        )
-        cotarget_scores, observed_pairs, expected_for_propensity = (
-            estimate_individual_propensity(
-                inputs.observed_assignment,
-                expectation_samples,
-                config.cotarget,
-            )
-        )
-
     cotarget_samples = []
     combined_samples = []
     for sample_index, base in enumerate(null_samples):
@@ -381,6 +368,7 @@ def run_attribution_experiment(
             preserve_multiplicity_profile=config.sampler.preserve_multiplicity_profile,
             max_same_target_per_site=config.sampler.max_same_target_per_site,
             steps=config.sampler.mcmc_steps_per_contact * n_contacts,
+            cotarget_include_self=include_self_repeats,
         )
         cotarget_samples.append(gibbs_target_swaps(
             base,
@@ -424,7 +412,8 @@ def run_attribution_experiment(
         "geometry_raw_score_sd": geometry.raw_score_sd,
         "cotargeting_enabled": bool(config.cotarget.enabled),
         "cotargeting_source": config.cotarget.source,
-        "cotargeting_expectation": config.cotarget.expectation,
+        "cotargeting_n_perm_expectation": int(config.cotarget.n_perm_expectation),
+        "cotargeting_include_self_repeats": include_self_repeats,
         "descriptive_same_neuron_propensity": bool(
             config.cotarget.enabled and config.cotarget.source == "observed_neuron"
         ),
@@ -442,9 +431,8 @@ def run_attribution_experiment(
         observed_pair_counts=observed_pairs,
         propensity_expectation=expected_for_propensity,
         samples=samples,
-        condition_summary=_condition_summary(samples, inputs, geometry),
-        pair_attribution=_pair_attribution(
-            samples, inputs, cotarget_scores, expected_for_propensity
+        condition_summary=_condition_summary(
+            samples, inputs, geometry, include_self_repeats
         ),
         diagnostics=diagnostics,
     )

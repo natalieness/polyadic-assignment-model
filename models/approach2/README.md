@@ -54,19 +54,39 @@ such as `0.5`, `1`, `2`, and `5` are useful sensitivity settings. Every Gibbs
 update still preserves the exact site degrees, target totals, and (when enabled)
 multiplicity profiles.
 
+### Two implementations of the same chain
+
+`gibbs_target_swaps` runs the chain through a compiled kernel in
+`sampler_numba.py`; `gibbs_target_swaps_nonumba` is the interpreted reference.
+They take the same arguments and return the same assignment for the same seed,
+so either can be substituted for the other — the reference is the one to read
+and to debug against, and `test_numba_matches_the_python_reference` pins them
+together across the option grid. The compiled path is roughly forty times faster
+per Gibbs call, and falls back to the reference automatically when numba is not
+installed. Setting `NUMBA_DISABLE_JIT=1` runs the kernel uncompiled, which is
+slow but steps through in a debugger.
+
 ## Individual co-targeting propensity
 
 The default `source="observed_neuron"` computes the number of observed sites
-containing every distinct target pair and compares it with the mean from the
-geometry-only simulations:
+containing every distinct target pair and compares it with the mean over
+`cotarget.n_perm_expectation` independent margin-preserving permutations:
 
 ```text
-log((observed + smoothing) / (geometry expectation + smoothing))
+log((observed + smoothing) / (permutation expectation + smoothing))
 ```
 
+Each permutation shuffles labelled target tokens into the fixed site slots, so
+the site degrees and target totals are exact and only the pairing is random.
+The draws come from their own RNG stream and never read the simulated
+conditions, so the expectation carries no MCMC autocorrelation and its count is
+tuned separately from `sampler.prediction_samples` — a low-variance denominator
+wants many cheap draws, the conditions want few expensive ones.
+
 Scores are shrunk towards zero when the observed and expected support is small,
-then standardized and clipped. Using a geometry expectation means that spatial
-co-localization is not automatically counted again as an individual preference.
+then standardized and clipped. Because the expectation is geometry-free, spatial
+co-localization is credited to the preference term here; the geometry condition
+in the factorial design is what separates the two.
 
 This same-neuron option is descriptive: it uses the observed assignment to
 estimate the preference being tested. For predictive evaluation use supplied

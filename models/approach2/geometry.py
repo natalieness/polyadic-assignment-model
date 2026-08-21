@@ -163,6 +163,7 @@ def geometry_scores(
     for target_index, target_id in enumerate(inputs.target_ids):
         backbone = backbones.get(int(target_id))
         if backbone is None:
+            print(f'No backbone for target {target_id}, skipping')
             continue
         target_points = backbone.nodes[["x", "y", "z"]].to_numpy(float)
         target_points *= config.coordinate_scale_to_um
