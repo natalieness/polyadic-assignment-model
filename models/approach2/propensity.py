@@ -100,8 +100,10 @@ def load_supplied_propensity(
     path: str | Path,
     target_ids: np.ndarray,
     config: CotargetConfig,
+    skeleton_id: int | None = None,
 ) -> np.ndarray:
     """Read target_a,target_b,score rows; unspecified requested pairs get zero.
+    If 'pre' column, exists, filter to only the current skeleton_id if available.
 
     Rows with ``target_a == target_b`` carry a self-repeat score and are only read
     when ``config.include_self_repeats`` is set; otherwise they are skipped.
@@ -110,6 +112,12 @@ def load_supplied_propensity(
     required = {"target_a", "target_b", "score"}
     if not required <= set(table.columns):
         raise ValueError(f"Supplied co-target file requires columns {sorted(required)}")
+    if "pre" in table.columns and skeleton_id is not None:
+        if skeleton_id in table["pre"].values:
+            table = table[table["pre"] == skeleton_id]
+        else:
+            print(f"Warning: skeleton {skeleton_id} not found in supplied co-target file")
+            print('Using all rows instead of filtering by "pre" column')
     include_self = config.include_self_repeats
     lookup = {int(target): index for index, target in enumerate(target_ids)}
     result = np.zeros((len(target_ids), len(target_ids)), dtype=float)

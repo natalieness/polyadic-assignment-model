@@ -288,6 +288,7 @@ def run_attribution_experiment(
             config.cotarget.supplied_scores or "",
             inputs.target_ids,
             config.cotarget,
+            skeleton_id=inputs.skeleton_id,
         )
         expected_for_propensity = mean_pair_count_matrix(
             expectation_samples, include_self_repeats
@@ -329,6 +330,189 @@ def run_attribution_experiment(
                 max_same_target_per_site=config.sampler.max_same_target_per_site,
                 max_restarts=config.sampler.max_null_restarts,
             )
+        base_samples.append(base)
+        geometry_samples.append(gibbs_target_swaps(
+            base,
+            inputs.site_degrees,
+            inputs.target_counts,
+            geometry.scores,
+            zero_cotarget,
+            _rng(config, inputs.skeleton_id, sample_index, 20),
+            geometry_weight=(
+                config.sampler.geometry_weight if config.geometry.enabled else 0.0
+            ),
+            cotargeting_weight=0.0,
+            temperature=config.sampler.temperature,
+            geometry_repeat_discount=config.geometry.repeat_discount,
+            cotarget_aggregation=config.cotarget.aggregation,
+            cotarget_site_clip=config.cotarget.site_score_clip,
+            self_repeat_penalty=config.sampler.self_repeat_penalty,
+            preserve_multiplicity_profile=config.sampler.preserve_multiplicity_profile,
+            max_same_target_per_site=config.sampler.max_same_target_per_site,
+            steps=config.sampler.mcmc_steps_per_contact * n_contacts,
+        ))
+    null_samples = np.stack(base_samples)
+    geometry_samples_array = np.stack(geometry_samples)
+
+    cotarget_samples = []
+    combined_samples = []
+    for sample_index, base in enumerate(null_samples):
+        common = dict(
+            site_degrees=inputs.site_degrees,
+            target_counts=inputs.target_counts,
+            cotarget_scores=cotarget_scores,
+            temperature=config.sampler.temperature,
+            geometry_repeat_discount=config.geometry.repeat_discount,
+            cotarget_aggregation=config.cotarget.aggregation,
+            cotarget_site_clip=config.cotarget.site_score_clip,
+            self_repeat_penalty=config.sampler.self_repeat_penalty,
+            preserve_multiplicity_profile=config.sampler.preserve_multiplicity_profile,
+            max_same_target_per_site=config.sampler.max_same_target_per_site,
+            steps=config.sampler.mcmc_steps_per_contact * n_contacts,
+            cotarget_include_self=include_self_repeats,
+        )
+        cotarget_samples.append(gibbs_target_swaps(
+            base,
+            geometry_scores=zero_geometry,
+            rng=_rng(config, inputs.skeleton_id, sample_index, 30),
+            geometry_weight=0.0,
+            cotargeting_weight=(
+                config.sampler.cotargeting_weight if config.cotarget.enabled else 0.0
+            ),
+            **common,
+        ))
+        combined_samples.append(gibbs_target_swaps(
+            base,
+            geometry_scores=geometry.scores,
+            rng=_rng(config, inputs.skeleton_id, sample_index, 40),
+            geometry_weight=(
+                config.sampler.geometry_weight if config.geometry.enabled else 0.0
+            ),
+            cotargeting_weight=(
+                config.sampler.cotargeting_weight if config.cotarget.enabled else 0.0
+            ),
+            **common,
+        ))
+
+    samples = {
+        "null": null_samples,
+        "geometry": geometry_samples_array,
+        "cotargeting": np.stack(cotarget_samples),
+        "combined": np.stack(combined_samples),
+    }
+    diagnostics = {
+        "sampler": "two_site_conditional_gibbs",
+        "skeleton_id": int(inputs.skeleton_id),
+        "n_sites": len(inputs.site_degrees),
+        "n_targets": len(inputs.target_ids),
+        "n_contacts": n_contacts,
+        "prediction_samples": n_samples,
+        "geometry_enabled": bool(config.geometry.enabled),
+        "target_backbones_available": int(geometry.backbone_available.sum()),
+        "target_backbones_requested": len(inputs.target_ids),
+        "geometry_raw_score_sd": geometry.raw_score_sd,
+        "cotargeting_enabled": bool(config.cotarget.enabled),
+        "cotargeting_source": config.cotarget.source,
+        "cotargeting_n_perm_expectation": int(config.cotarget.n_perm_expectation),
+        "cotargeting_include_self_repeats": include_self_repeats,
+        "descriptive_same_neuron_propensity": bool(
+            config.cotarget.enabled and config.cotarget.source == "observed_neuron"
+        ),
+        "multiplicity_profile_source": config.sampler.multiplicity_profile_source,
+        "preserve_multiplicity_profile": config.sampler.preserve_multiplicity_profile,
+        "geometry_weight": config.sampler.geometry_weight,
+        "cotargeting_weight": config.sampler.cotargeting_weight,
+        "temperature": config.sampler.temperature,
+        "random_seed": config.sampler.random_seed,
+    }
+    result = AttributionResult(
+        inputs=inputs,
+        geometry=geometry,
+        cotarget_scores=cotarget_scores,
+        observed_pair_counts=observed_pairs,
+        propensity_expectation=expected_for_propensity,
+        samples=samples,
+        condition_summary=_condition_summary(
+            samples, inputs, geometry, include_self_repeats
+        ),
+        diagnostics=diagnostics,
+    )
+    result.validate()
+    return result
+
+
+def run_sampler_with_permutation(
+    repository: DataRepository,
+    skeleton_id: int,
+    config: Approach2Config,
+) -> AttributionResult:
+    config.validate()
+    inputs = load_observed_inputs(repository, int(skeleton_id))
+    geometry = geometry_scores(repository, inputs, config.geometry)
+    n_samples = config.sampler.prediction_samples
+    n_contacts = int(inputs.site_degrees.sum())
+    zero_geometry = np.zeros_like(geometry.scores)
+    zero_cotarget = np.zeros((len(inputs.target_ids), len(inputs.target_ids)), dtype=float)
+    base_samples = []
+    geometry_samples = []
+
+    if config.sampler.max_same_target_per_site is not None and (
+        inputs.observed_assignment.max(initial=0)
+        > config.sampler.max_same_target_per_site
+        and config.sampler.multiplicity_profile_source == "observed"
+    ):
+        raise ValueError("Observed multiplicity exceeds max_same_target_per_site")
+
+    # The expectation comes from its own permutations, so the co-targeting scores are
+    # settled before any condition is simulated rather than after the null run.
+    expectation_samples = permutation_expectation_samples(inputs, config)
+    print(f"expectation_samples.shape: {expectation_samples.shape}")
+    include_self_repeats = bool(config.cotarget.include_self_repeats)
+    observed_pairs = pair_count_matrix(inputs.observed_assignment, include_self_repeats)
+    if not config.cotarget.enabled or config.cotarget.source == "none":
+        cotarget_scores = zero_cotarget
+        expected_for_propensity = mean_pair_count_matrix(
+            expectation_samples, include_self_repeats
+        )
+    elif config.cotarget.source == "supplied":
+        cotarget_scores = load_supplied_propensity(
+            config.cotarget.supplied_scores or "",
+            inputs.target_ids,
+            config.cotarget,
+            skeleton_id=inputs.skeleton_id,
+        )
+        expected_for_propensity = mean_pair_count_matrix(
+            expectation_samples, include_self_repeats
+        )
+    else:
+        cotarget_scores, observed_pairs, expected_for_propensity = (
+            estimate_individual_propensity(
+                inputs.observed_assignment,
+                expectation_samples,
+                config.cotarget,
+            )
+        )
+
+    for sample_index in range(n_samples):
+        # rather than just leaving it for the null, always do the gibbs target swaps for the base
+        base = gibbs_target_swaps(
+            expectation_samples[sample_index, :, :],
+            inputs.site_degrees,
+            inputs.target_counts,
+            zero_geometry,
+            zero_cotarget,
+            _rng(config, inputs.skeleton_id, sample_index, 10),
+            geometry_weight=0.0,
+            cotargeting_weight=0.0,
+            temperature=config.sampler.temperature,
+            geometry_repeat_discount=0.0,
+            cotarget_aggregation=config.cotarget.aggregation,
+            cotarget_site_clip=config.cotarget.site_score_clip,
+            self_repeat_penalty=0.0,
+            preserve_multiplicity_profile=config.sampler.preserve_multiplicity_profile,
+            max_same_target_per_site=config.sampler.max_same_target_per_site,
+            steps=config.sampler.null_burnin_steps_per_contact * n_contacts,
+        )
         base_samples.append(base)
         geometry_samples.append(gibbs_target_swaps(
             base,

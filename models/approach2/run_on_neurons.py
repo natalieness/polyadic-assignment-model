@@ -16,6 +16,7 @@ REPO_ROOT = Path("/Users/nessn/git-repos/polyadic-assignment-model")
 sys.path.insert(0, str(REPO_ROOT))
 os.chdir(REPO_ROOT)
 from models.validate_predictions_functions import get_target_co_occurrence
+from models.padj_functions import get_assignment_matrix, get_co_targeting_matrix, compute_cosine
 from models.approach1.data import DataRepository
 from models.approach2 import Approach2Config, run_attribution_experiment
 
@@ -71,6 +72,10 @@ print(f'Running on {len(skids)} neurons')
 # so parallel results are identical to serial ones regardless of finish order.
 RUN_PARALLEL = True
 N_JOBS = -1
+
+# local params 
+config.cotarget.source = "supplied"
+config.cotarget.supplied_scores = Path("data/cotargeting_rules/neuron_id_based_cotargeting.csv")
 
 if RUN_PARALLEL:
     from models.approach2.parallel import run_experiments
@@ -135,36 +140,6 @@ cdf = pd.concat(conditions, names=["skeleton_id"]).reset_index(level='skeleton_i
 
 
 # %%
-def get_assignment_matrix(hyperedges):
-    u_targets = set(list(chain.from_iterable(hyperedges)))
-    u_targets = list(u_targets)
-    n_targets = len(u_targets)
-    target_map = {t:i for i,t in enumerate(u_targets)}
-    n_sites = len(hyperedges)
-    X = np.zeros((n_sites, n_targets), dtype=int)
-    for i, edge in enumerate(hyperedges):
-        for t in edge:
-            X[i, target_map[t]] += 1
-    return X, u_targets
-
-def get_co_targeting_matrix(con_sub, skeleton_id, presyn_col='presynaptic_to', postsyn_col='postsynaptic_to'):
-    # assume postsynaptic_to already a list 
-    hyperedges = con_sub.loc[con_sub[presyn_col]==skeleton_id][postsyn_col].tolist()
-    assignment_matrix, u_targets = get_assignment_matrix(hyperedges)
-    co_targeting_matrix = get_target_co_occurrence(assignment_matrix)
-    return co_targeting_matrix, u_targets
-
-def compute_cosine(real_flat, padj_perm):
-    # k=0 keeps the diagonal, so same-target repeats count towards the similarity.
-    pred_flat = padj_perm[np.triu_indices_from(padj_perm, k=0)]
-    dot_product = np.dot(real_flat, pred_flat)
-    norm_real = np.linalg.norm(real_flat)
-    norm_pred = np.linalg.norm(pred_flat)
-    if norm_real == 0 or norm_pred == 0:
-        return np.nan
-    else:
-        return (dot_product / (norm_real * norm_pred))
-
 cos_sims = {}
 # padj_perms = {}
 for e, sk in enumerate(skids[:]):
@@ -341,23 +316,28 @@ for prefix in ['delta_', 'fractional_gain_']:
 #%% heatmap improvements 
 
 cs_mean_sorted = cs_mean.copy()
-cs_mean_sorted = cs_mean_sorted.sort_values('celltype')
+# do a hierarchical sorting 
+cs_mean_sorted = cs_mean_sorted.sort_values(by=['null'] + [f'delta_{cond}' for cond in compare_conds], ascending=[True] + [False]*len(compare_conds))
 H = cs_mean_sorted[['null'] + [f'delta_{cond}' for cond in compare_conds]].values
 fig, ax = plt.subplots(1, 1, figsize=(4, 8))
 sns.heatmap(H, ax=ax, cmap='coolwarm', center=0)
+ax.set_xticklabels(['null'] + [f'delta_{cond}' for cond in compare_conds], rotation=90, ha='right')
 
 #%% attempt to categorise 
 
 # almost fully recovered by null 
 
 cat = cs_mean[['sk', 'null', 'geometry', 'cotargeting', 'combined', 'hemi', 'name', 'celltype', 'delta_geometry','delta_cotargeting','delta_combined']].copy()
+# drop those without data 
+cat = cat.dropna(subset=['null', 'geometry', 'cotargeting', 'combined'])
+
 cat['recovery_under_null'] = ['full' if x > 0.75 else 'good' if x > 0.5 else 'ok' if x > 0.25 else 'poor' for x in cat['null']]
 cat['best_recovery'] = cat[['null', 'geometry', 'cotargeting', 'combined']].max(axis=1)
 cat['recoverable'] = ['full' if x > 0.75 else 'good' if x > 0.5 else 'ok' if x > 0.25 else 'poor' for x in cat['best_recovery']]
 cat['best_method'] = cat[['null', 'geometry', 'cotargeting', 'combined']].idxmax(axis=1)
 cat['relative_gain_geometry'] = cat['delta_geometry'] / (cat['delta_geometry'] + cat['delta_cotargeting'])
 cat['relative_gain_cotargeting'] = cat['delta_cotargeting'] / (cat['delta_geometry'] + cat['delta_cotargeting'])
-cat['relative_additional_gain_combined'] = cat.apply(lambda row: row['delta_combined'] / (row['delta_combined']+ max(row[['delta_geometry', 'delta_cotargeting']])), axis=1)
+cat['relative_additional_gain_combined'] = cat.apply(lambda row: (row['delta_combined']) / (row['delta_combined']+ max(row[['delta_geometry', 'delta_cotargeting']])) if (row['delta_combined']+ max(row[['delta_geometry', 'delta_cotargeting']])) != 0 else 0.5, axis=1)
 cat['best_gain_over_null'] = cat['best_recovery'] - cat['null']
 cat['substantial_gain_over_null'] = cat['best_gain_over_null'] > 0.1
 cat['substantial_gain_method'] = cat.apply(lambda row: 'cotargeting' if row['relative_gain_cotargeting'] > 0.6 else 'geometry' if row['relative_gain_cotargeting'] < 0.4 else 'equal', axis=1)
@@ -447,7 +427,7 @@ def plot_recovery_sankey(df, count_col="count"):
 fig, nodes, node_idx = plot_recovery_sankey(grouped_counts, count_col="count")
 
 
-    # %% check quality of sampler results in terms of geometric adherence  
+# %% check quality of sampler results in terms of geometric adherence  
 
 # def get_observed_distances(obs_ass, distances_um_i):
 #     # get any double instances twice 
@@ -511,12 +491,33 @@ ax[0].set_ylim(ax0_min, ax0_max)
 ax[1].set_xlim(ax1_min, ax1_max)
 ax[1].set_ylim(ax1_min, ax1_max)
 
+# plot histograms instead 
+
+fig, ax = plt.subplots(1, 2, figsize=(8, 5))
+alpha = 0.5
+color_real = 'blue'
+color_sampled = 'orange'
+bins_median = np.linspace(min(geo_adherence_geo['median_real'].min(), geo_adherence_geo['median_sampled'].min()), max(geo_adherence_geo['median_real'].max(), geo_adherence_geo['median_sampled'].max()), 40)
+bins_max = np.linspace(min(geo_adherence_geo['max_real'].min(), geo_adherence_geo['max_sampled'].min()), max(geo_adherence_geo['max_real'].max(), geo_adherence_geo['max_sampled'].max()), 40)
+ax[0].hist(geo_adherence_geo['median_real'], label='observed', color=color_real, alpha=alpha, bins=bins_median)
+ax[0].hist(geo_adherence_geo['median_sampled'], label='sampled', color= color_sampled, alpha=alpha, bins=bins_median)
+ax[1].hist(geo_adherence_geo['max_real'], label='observed', color=color_real, alpha=alpha, bins=bins_max)
+ax[1].hist(geo_adherence_geo['max_sampled'], label='sampled', color=color_sampled, alpha=alpha, bins=bins_max)
+
+ax[0].set_xlabel('Median distance (um)')
+ax[0].set_ylabel('Number of neurons')
+ax[1].set_xlabel('Max distance (um)')
+ax[1].set_ylabel('Number of neurons') 
+ax[0].legend()
+ax[1].legend()
+fig.tight_layout()
+
 #%% 
 fig, ax = plt.subplots(1, 1, figsize=(5, 5))
 col = 'frac_within_median'
 data_melted = pd.concat([geo_adherence_geo[col], geo_adherence_combined[col], geo_adherence_cotargeting[col], geo_adherence_null[col]], axis=1)
 data_melted.columns = ['geometry', 'combined', 'cotargeting', 'null']
 data_melted = data_melted.melt(var_name='condition', value_name=col)
-sns.swarmplot(data=data_melted, x='condition', y=col, ax=ax, s=2)
+sns.violinplot(data=data_melted, x='condition', y=col, ax=ax)
 
 # %%
