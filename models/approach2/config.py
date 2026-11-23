@@ -42,6 +42,10 @@ class CotargetConfig:
     # The whole matrix stays in site units: the diagonal counts sites where a target
     # appears more than once, exactly as the off diagonal counts sites sharing a pair.
     include_self_repeats: bool = False
+    # Count a repeated target once per contact when building the pair matrices, so a
+    # site holding [A, A, B] adds two to the A/B cell rather than one. Moves the
+    # propensity from site units into contact-pair units on both sides of the ratio.
+    count_multiples: bool = False
 
 
 @dataclass

@@ -11,7 +11,9 @@ from .config import CotargetConfig
 
 
 def pair_count_matrix(
-    assignment: np.ndarray, include_self_repeats: bool = False
+    assignment: np.ndarray,
+    include_self_repeats: bool = False,
+    count_multiples: bool = False,
 ) -> np.ndarray:
     """Number of sites containing each unordered pair of distinct targets.
 
@@ -19,8 +21,23 @@ def pair_count_matrix(
     target appears more than once. That keeps the whole matrix in site units: the
     off diagonal counts sites, so the diagonal counts sites too rather than the
     ``m * (m - 1) / 2`` contact pairs a multiplicity-weighted matrix would use.
+
+    ``count_multiples`` switches the whole matrix into those contact-pair units
+    instead. A repeated target then counts once per contact, so a site holding
+    ``[A, A, B]`` adds ``2`` to the A/B cell rather than ``1``, and the diagonal
+    counts within-site contact pairs of one target (``n * (n - 1) / 2``) rather
+    than sites. Observed and expected matrices must be built with the same
+    setting: the propensity is their ratio, so mixed units would be meaningless.
     """
     assignment = np.asarray(assignment)
+    if count_multiples:
+        counts = np.rint(assignment).astype(np.int64)
+        result = counts.T @ counts
+        if include_self_repeats:
+            np.fill_diagonal(result, (counts * (counts - 1) // 2).sum(axis=0))
+        else:
+            np.fill_diagonal(result, 0)
+        return result
     present = assignment > 0
     # Integer accumulation is exact and avoids spurious floating-point BLAS
     # overflow warnings seen for these small binary matrices on some NumPy builds.
@@ -34,13 +51,18 @@ def pair_count_matrix(
 
 
 def mean_pair_count_matrix(
-    samples: np.ndarray, include_self_repeats: bool = False
+    samples: np.ndarray,
+    include_self_repeats: bool = False,
+    count_multiples: bool = False,
 ) -> np.ndarray:
     samples = np.asarray(samples)
     if samples.ndim != 3:
         raise ValueError("Samples must have shape samples x sites x targets")
     return np.mean(
-        [pair_count_matrix(sample, include_self_repeats) for sample in samples],
+        [
+            pair_count_matrix(sample, include_self_repeats, count_multiples)
+            for sample in samples
+        ],
         axis=0,
     )
 
@@ -79,11 +101,19 @@ def estimate_individual_propensity(
     observed_assignment: np.ndarray,
     expected_samples: np.ndarray,
     config: CotargetConfig,
+    count_multiples: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Estimate shrunk log enrichment relative to a simulated expectation."""
+    """Estimate shrunk log enrichment relative to a simulated expectation.
+
+    ``count_multiples`` overrides ``config.count_multiples`` for this call; left
+    at ``None`` the config decides. Both counting matrices follow it together, so
+    the enrichment ratio keeps one set of units.
+    """
     include_self = config.include_self_repeats
-    observed = pair_count_matrix(observed_assignment, include_self)
-    expected = mean_pair_count_matrix(expected_samples, include_self)
+    if count_multiples is None:
+        count_multiples = bool(getattr(config, "count_multiples", False))
+    observed = pair_count_matrix(observed_assignment, include_self, count_multiples)
+    expected = mean_pair_count_matrix(expected_samples, include_self, count_multiples)
     raw = np.log((observed + config.smoothing) / (expected + config.smoothing))
     support = observed + expected
     weight = support / (support + config.shrinkage)

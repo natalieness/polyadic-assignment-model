@@ -142,6 +142,32 @@ combined_samples = result.samples["combined"]
 Looping over a test set only requires concatenating `condition_summary` and
 `pair_attribution` after adding the corresponding skeleton ID.
 
+### Saving results
+
+Two formats, for two different jobs:
+
+```python
+# One JSON file holding the whole result, for reloading into Python later.
+result.to_json("out/29.json")            # "out/29.json.gz" compresses on the way out
+
+from models.approach2 import load_result
+result = load_result("out/29.json")      # same object, same attribute access
+result.inputs.observed_assignment, result.samples["null"], result.condition_summary
+
+# A directory of CSVs plus diagnostics.json and assignment_samples.npz,
+# for inspecting or loading somewhere other than Python.
+result.save("out/29/")
+```
+
+`to_json` writes every field, so `load_result` returns a real `AttributionResult`
+with `FixedNeuronInputs` and `GeometryResult` inside it — methods such as
+`validate()` and `save()` work on the reloaded object. Pass
+`include_samples=False` to omit the raw draws, which otherwise dominate the file
+size; each condition then reads back as `None`.
+
+`run_experiments(..., output_dir="out")` writes one such JSON per neuron,
+`out/<skeleton_id>.json`, from inside the workers.
+
 ## Multiplicity choices
 
 Recommended identity-only attribution:

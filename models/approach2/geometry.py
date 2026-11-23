@@ -127,8 +127,9 @@ def geometry_scores(
     repository: DataRepository,
     inputs: FixedNeuronInputs,
     config: GeometryConfig,
-    use_binary_possibility: bool = True, #NOTE: think this is the better implementation
-    use_local_max_target_dist: bool = True # NOTE: not tested
+    use_binary_possibility: bool = True, # binary possibility of target in reach or not
+    use_binary_and_soft: bool = True, # binary possibility of target in reach or not and soft gaussian kernel for distance to target backbone
+    use_local_max_target_dist: bool = True # using local max target distance to target backbones instead of a fixed bandwidth
 ) -> GeometryResult:
     """Return target-specific, column-centred proximity scores.
 
@@ -171,8 +172,9 @@ def geometry_scores(
             site_points, target_points, config.distance_chunk_size
         )
         distances[:, target_index] = target_distance
-        
-        if use_binary_possibility:
+        if use_binary_and_soft:
+            kernel = (target_distance <= (dist_threshold)).astype(float) * np.exp(-0.5 * (target_distance / dist_threshold) ** 2)
+        elif use_binary_possibility:
             kernel = (target_distance <= (dist_threshold)).astype(float)
         else:
             kernel = np.exp(-0.5 * (target_distance / dist_threshold) ** 2)

@@ -111,4 +111,11 @@ for res, res_name in zip([result, result_att], ['Result from null', 'Result from
         sns.histplot(comp_d.flatten(), ax=a, bins=bins, stat='density', label='Sample', color='orange')
     fig.suptitle(f'{res_name}, temp {temp}, skeleton {skid}')
     fig.tight_layout()
+
+
+# %%
+# get local max target distances for each neuron
+lmt = pd.read_csv('data/max_presyn_to_backbone_distances_by_skid.csv')
+lmt['presynaptic_to'] = lmt['presynaptic_to'].astype(int)
+
 # %%

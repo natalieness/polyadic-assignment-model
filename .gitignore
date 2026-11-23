@@ -30,3 +30,4 @@ figures/
 *.parquet
 *.npz
 *.html
+*.nc

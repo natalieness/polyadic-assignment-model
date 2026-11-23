@@ -18,6 +18,7 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -26,7 +27,7 @@ import pandas as pd
 from models.approach1.data import DataRepository
 
 from .config import Approach2Config
-from .simulator import run_attribution_experiment
+from .simulator import run_attribution_experiment, run_attribution_experiment_shapley
 
 CONDITIONS = ("null", "geometry", "cotargeting", "combined")
 
@@ -34,6 +35,12 @@ CONDITIONS = ("null", "geometry", "cotargeting", "combined")
 # per process instead of once per neuron.
 _WORKER_CONFIG: Approach2Config | None = None
 _WORKER_REPOSITORY: DataRepository | None = None
+
+# Where each worker writes its per-neuron JSON file, or ``None`` to keep results
+# in memory only. Workers write straight to disk so the full
+# ``AttributionResult`` never has to travel back through the pipe.
+_WORKER_OUTPUT_DIR: Path | None = None
+_WORKER_INCLUDE_SAMPLES: bool = True
 
 # Set in the parent immediately before a forked pool starts. Forked children
 # inherit module globals, so they can read the parent's repository straight out
@@ -96,10 +103,23 @@ def _extract_payload(result, keep_samples: bool) -> dict[str, Any]:
     }
 
 
+def _save_result(result, output_dir: Path | None, skeleton_id: int, include_samples: bool) -> None:
+    """Write one neuron's whole result to ``<output_dir>/<skeleton_id>.json``.
+
+    One file per neuron, named after the skeleton ID, so parallel workers never
+    write to the same path and reloading a neuron is a single ``from_json``.
+    """
+    if output_dir is None:
+        return
+    result.to_json(output_dir / f"{skeleton_id}.json", include_samples=include_samples)
+
+
 def _init_worker(
     config: Approach2Config,
     threads_per_worker: int | None,
     inherit_repository: bool,
+    output_dir: Path | None,
+    include_samples: bool,
 ) -> None:
     """Give the worker process a repository and pin its BLAS thread count.
 
@@ -108,6 +128,9 @@ def _init_worker(
     multi-second CSV parse in every worker for no gain.
     """
     global _WORKER_CONFIG, _WORKER_REPOSITORY
+    global _WORKER_OUTPUT_DIR, _WORKER_INCLUDE_SAMPLES
+    _WORKER_OUTPUT_DIR = output_dir
+    _WORKER_INCLUDE_SAMPLES = include_samples
     if threads_per_worker is not None:
         # Without this every worker starts a full-width BLAS pool and the
         # processes fight over the same cores.
@@ -132,10 +155,16 @@ def _run_one(skeleton_id: int, keep_samples: bool) -> tuple[int, dict[str, Any] 
     if _WORKER_REPOSITORY is None or _WORKER_CONFIG is None:
         raise RuntimeError("Worker was not initialised via _init_worker")
     try:
-        result = run_attribution_experiment(
+        result = run_attribution_experiment_shapley(
             _WORKER_REPOSITORY,
             skeleton_id=int(skeleton_id),
             config=_WORKER_CONFIG,
+        )
+        # Saved here rather than in the parent: the parent only ever receives
+        # the reduced payload, and a write failure is worth reporting like any
+        # other per-neuron error.
+        _save_result(
+            result, _WORKER_OUTPUT_DIR, int(skeleton_id), _WORKER_INCLUDE_SAMPLES
         )
     except Exception as error:  # noqa: BLE001 - reported back to the parent
         return int(skeleton_id), None, f"{type(error).__name__}: {error}"
@@ -169,6 +198,8 @@ def run_experiments(
     start_method: str | None = None,
     threads_per_worker: int | None = 1,
     progress: bool = True,
+    output_dir: str | Path | None = None,
+    include_samples: bool | None = None,
 ) -> ExperimentResults:
     """Run ``run_attribution_experiment`` for every skeleton, optionally in parallel.
 
@@ -199,11 +230,27 @@ def run_experiments(
         start methods that import numpy afresh (``spawn``/``forkserver``).
     progress:
         Print one line per finished neuron, as the serial loop does.
+    output_dir:
+        When set, every neuron's full ``AttributionResult`` is written to
+        ``output_dir/<skeleton_id>.json`` via ``AttributionResult.to_json``
+        before the reduced payload is returned, and comes back with
+        ``AttributionResult.from_json``. Independent of ``keep_samples``: the
+        disk copy is complete even when the in-memory samples are dropped.
+    include_samples:
+        Whether the saved JSON carries the raw draws. ``None`` follows
+        ``config.output.save_raw_samples``. Ignored unless ``output_dir`` is set.
     """
     skids = [int(value) for value in skids]
     results = ExperimentResults()
     if not skids:
         return results
+
+    if include_samples is None:
+        include_samples = bool(config.output.save_raw_samples)
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        # Fail here rather than inside a worker if the location is unusable.
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     workers = _resolve_workers(n_jobs)
     if workers == 1:
@@ -212,9 +259,10 @@ def run_experiments(
         for index, skeleton_id in enumerate(skids):
             started = time.time()
             try:
-                result = run_attribution_experiment(
+                result = run_attribution_experiment_shapley(
                     repository, skeleton_id=skeleton_id, config=config
                 )
+                _save_result(result, output_dir, skeleton_id, include_samples)
             except Exception as error:  # noqa: BLE001 - same policy as the pool
                 message = f"{type(error).__name__}: {error}"
                 results.errors[skeleton_id] = message
@@ -242,7 +290,13 @@ def run_experiments(
             max_workers=workers,
             mp_context=context,
             initializer=_init_worker,
-            initargs=(config, threads_per_worker, inherit_repository),
+            initargs=(
+                config,
+                threads_per_worker,
+                inherit_repository,
+                output_dir,
+                include_samples,
+            ),
         ) as executor:
             futures = {
                 executor.submit(_run_one, skeleton_id, keep_samples): skeleton_id

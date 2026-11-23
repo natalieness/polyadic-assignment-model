@@ -565,7 +565,7 @@ expected = expected / len(perms)
 # the counts here never pass through an assignment matrix
 raw = np.log((observed + smoothing) / (expected + smoothing))
 support = observed + expected
-propensity_scores = (support / (support + shrinkage)) * raw   # n_target x n_target
+propensity_scores = (support / (support + shrinkage)) * raw # n_target x n_target
 if not include_self:
     np.fill_diagonal(propensity_scores, 0.0)
 
